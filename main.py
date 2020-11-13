@@ -1,44 +1,20 @@
 from io import BytesIO
 from os import environ
 
-import aiosqlite
 import asyncio
 
-from bitcoinrpc import BitcoinRPC
-from bitcoinrpc.bitcoin_rpc import RPCError
 from buidl.block import Block
 from sanic import Sanic
 from sanic.response import json
 
-
-CORE_HOST = environ.get("CORE_HOST", "localhost")
-CORE_PORT = int(environ.get("CORE_PORT", "18332"))  # default to testnet
-CORE_USER = environ.get("CORE_USER")
-if not CORE_USER:
-    raise Exception("Must supply CORE_USER")
-CORE_PASSWORD = environ.get("CORE_PASSWORD")
-if not CORE_PASSWORD:
-    raise Exception("Must supply CORE_PASSWORD")
+import models
+import rpc
 
 
 PYTHON_HOST = environ.get("PYTHON_HOST", "0.0.0.0")
 PYTHON_PORT = int(environ.get("PYTHON_PORT", "8000"))
 
-print(
-    "Remote Bitcoin Core RPC Server: %s@%s:%s:%s"
-    % (CORE_USER, CORE_PASSWORD, CORE_HOST, CORE_PORT)
-)
-
-rpc = BitcoinRPC(CORE_HOST, CORE_PORT, CORE_USER, CORE_PASSWORD)
-
 app = Sanic("Python Bitcoin Core Node Wrapper")
-
-DB_STRING = "/Users/mflaxman/coinwatch.sqlite"
-# DB_STRING = ":memory:"
-CREATE_STATEMENTS = [
-    """CREATE TABLE IF NOT EXISTS blocks (height integer primary key asc, hash string)""",
-    """CREATE UNIQUE INDEX IF NOT EXISTS idx_block_hash ON blocks (hash);""",
-]
 
 
 async def do_fetch(db):
@@ -51,45 +27,31 @@ async def do_fetch(db):
         db_curr_height = row[0]
 
     # FIXME: handle orphaned chain!
-    core_res = await make_bitcoin_core_request(
-        method="getblockcount",
-    )
+    core_block_height = await rpc.get_block_count()
 
-    if core_res["error"]:
-        print("ERROR!", core_res)
-        return
-
-    for block_height in range(db_curr_height + 1, core_res["result"]):
-        core_res = await make_bitcoin_core_request(
-            method="getblockhash",
-            params=[block_height],
-        )
-        if core_res["error"]:
-            print("subfetch error", core_res)
-            return
-
-        blockhash = core_res["result"]
-        core_res = await make_bitcoin_core_request(
-            method="getblock",
-            params=[blockhash, 0],  # 0 verbosity for hex
-        )
-        if core_res["error"]:
-            print("subsubfetch error", core_res)
-            return
+    for block_height in range(db_curr_height + 1, core_block_height):
+        block_hash = await rpc.get_block_hash(block_height)
+        block_hex = await rpc.get_block_hex(block_hash)
 
         # Attempt to parse the block (TODO: save data)
-        block_obj = Block.parse_header(BytesIO(bytes.fromhex(core_res["result"])))
-        assert block_obj.id() == blockhash, "Bad block parse!"
-        if block_height % 10 == 0:
-            print("Parsed without error")
+        block_obj = Block.parse_header(BytesIO(bytes.fromhex(block_hex)))
+        assert block_obj.id() == block_hash, "Bad block parse!"
+        if block_height % 100 == 0:
+            print(f"Parsed {block_height} without error")
 
         if block_height % 1000 == 0:
             print(f"inserting... {block_height}")
-        await app.db.execute(
-            "INSERT INTO blocks(height, hash) values (?, ?)",
-            [block_height, core_res["result"]],
-        )  # FIXME: named args
-        await app.db.commit()
+        await models.insert_block(
+            db=app.db,
+            blockhash_hex=block_obj.id(),
+            height=block_height,
+            version=block_obj.version,
+            prev_hash=block_obj.prev_block,
+            merkle_root=block_obj.merkle_root,
+            timestamp=block_obj.timestamp,
+            bits=block_obj.bits,
+            nonce=block_obj.nonce,
+        )
 
 
 async def fetch_block_headers(db):
@@ -100,18 +62,10 @@ async def fetch_block_headers(db):
         await asyncio.sleep(5)
 
 
-async def db_setup():
-    print("Connecting to sqlite3 DB {DB_STRING}...")
-    db = await aiosqlite.connect(DB_STRING)
-    for create_statement in CREATE_STATEMENTS:
-        await db.execute(create_statement)
-    return db
-
-
 # https://sanic.readthedocs.io/en/0.5.4/sanic/middleware.html#listeners
 @app.listener("before_server_start")
 async def setup_db(app, loop):
-    app.db = await db_setup()
+    app.db = await models.db_setup()
 
 
 # https://github.com/huge-success/sanic/issues/1012#issuecomment-351120972
@@ -125,97 +79,44 @@ async def close_db(app, loop):
     await app.db.close()
 
 
-async def make_bitcoin_core_request(method, params=[]):
-    print(f"Querying bitcoin core with {method}: {params}")
-    try:
-        res = await rpc.acall(method, params)
-        print("SUCCESS", res)
-        return {
-            "result": res,
-            "error": None,
-        }
-    except RPCError as e:
-        print("ERROR", e.code, e.message)
-        return {
-            "error": {
-                "message": e.message,
-                "code": e.code,
-            },
-            "result": None,
-        }
-
-
 @app.get("/core/getblockchaininfo")
-async def wrapper(request, path=None):
+async def core_info(request, path=None):
 
-    to_return = await make_bitcoin_core_request(
-        method="getblockchaininfo",
-    )
-    return json(to_return)
+    return json(await rpc.get_blockchain_info())
 
 
 @app.get("/core/getblockhash/<blockheight:int>")
-async def wrapper(request, blockheight):
+async def core_blockhash(request, blockheight):
 
-    cursor = await app.db.execute("SELECT hash FROM blocks")
-    row = await cursor.fetchone()
-    await cursor.close()  # FIXME: with wrapper
-    print("ROW", row)
-
-    if row:
-        print("Found in sqlite")
-        return json({"result": row[0], "error": None})
-
-    to_return = await make_bitcoin_core_request(
-        method="getblockhash",
-        params=[blockheight],
-    )
-    # FIXME: error handling
-    print("inserting...")
-    await app.db.execute(
-        "INSERT INTO blocks(height, hash) values (?, ?)",
-        [blockheight, to_return["result"]],
-    )  # FIXME: named args
-    await app.db.commit()
-
-    return json(to_return)
+    return json({"block_hash": await rpc.get_block_hash(block_height_int=blockheight)})
 
 
 @app.get("/core/getblock/<blockhash:string>")
-async def wrapper(request, blockhash):
+async def core_getblock(request, blockhash):
 
-    to_return = await make_bitcoin_core_request(
-        method="getblock",
-        params=[blockhash, 0],  # 0 verbosity for hex
+    return json(
+        {
+            "block_hex": await rpc.get_block_hex(blockhash),
+        }
     )
-    return json(to_return)
 
 
 @app.get("/core/getblockfilter/<blockhash:string>")
-async def wrapper(request, blockhash):
+async def core_getblockfilter(request, blockhash):
 
-    to_return = await make_bitcoin_core_request(
-        method="getblockfilter",
-        params=[blockhash],  # 0 verbosity for hex
-    )
-    return json(to_return)
+    block_filter = await rpc.get_block_filter(blockhash)
+    return json(block_filter)  # TODO: explicitly handle this
 
 
 @app.get("/status")
-async def wrapper(request):
+async def coinwatcher_status(request):
 
-    cursor = await app.db.execute(
-        "SELECT height FROM blocks ORDER BY height DESC LIMIT 1"
+    return json(
+        {
+            "sqlite_height": await models.get_latest_blockheight(db=app.db),
+            "bitcoin_core": await rpc.get_block_count(),
+        }
     )
-    row = await cursor.fetchone()
-    await cursor.close()  # FIXME: with wrapper
-    print("ROW", row)
-
-    to_return = await make_bitcoin_core_request(
-        method="getblockcount",
-    )
-    assert to_return["error"] is None
-    return json({"sqlite_height": row[0], "bitcoin_core": to_return["result"]})
 
 
 if __name__ == "__main__":
