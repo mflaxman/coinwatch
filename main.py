@@ -1,11 +1,12 @@
+from io import BytesIO
+from os import environ
+
 import aiosqlite
 import asyncio
 
 from bitcoinrpc import BitcoinRPC
 from bitcoinrpc.bitcoin_rpc import RPCError
-
-from os import environ
-
+from buidl.block import Block
 from sanic import Sanic
 from sanic.response import json
 
@@ -67,7 +68,23 @@ async def do_fetch(db):
             print("subfetch error", core_res)
             return
 
-        print(f"inserting... {block_height}")
+        blockhash = core_res["result"]
+        core_res = await make_bitcoin_core_request(
+            method="getblock",
+            params=[blockhash, 0],  # 0 verbosity for hex
+        )
+        if core_res["error"]:
+            print("subsubfetch error", core_res)
+            return
+
+        # Attempt to parse the block (TODO: save data)
+        block_obj = Block.parse_header(BytesIO(bytes.fromhex(core_res["result"])))
+        assert block_obj.id() == blockhash, "Bad block parse!"
+        if block_height % 10 == 0:
+            print("Parsed without error")
+
+        if block_height % 1000 == 0:
+            print(f"inserting... {block_height}")
         await app.db.execute(
             "INSERT INTO blocks(height, hash) values (?, ?)",
             [block_height, core_res["result"]],
